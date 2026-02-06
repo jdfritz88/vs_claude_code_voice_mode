@@ -35,7 +35,7 @@ except ImportError:
 WHISPER_URL = "http://127.0.0.1:8787"
 SAMPLE_RATE = 16000
 CHANNELS = 1
-STATE_FILE = Path("F:/Apps/freedom_system/freedom_system_2000/vs_claude_code_voice_mode/mic_state.json")
+STATE_FILE = Path("F:/Apps/freedom_system/REPO_vs_claude_code_voice_mode/mic_state.json")
 LOG_FILE = Path("F:/Apps/freedom_system/log/vs_claude_code_voice_mode_mic_panel.log")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
