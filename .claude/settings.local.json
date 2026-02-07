@@ -27,7 +27,17 @@
       "Bash(git mv:*)",
       "Bash(git rm:*)",
       "Bash(del nul)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(del \"F:\\\\Apps\\\\freedom_system\\\\log\\\\vs_claude_code_voice_mode.log\")",
+      "Bash(\"F:\\\\Apps\\\\freedom_system\\\\app_cabinet\\\\whisper_stt\\\\venv\\\\Scripts\\\\pip.exe\" install faster-whisper)",
+      "Bash(\"F:\\\\Apps\\\\freedom_system\\\\app_cabinet\\\\whisper_stt\\\\venv\\\\Scripts\\\\python.exe\" -m pip install:*)",
+      "Bash(\"F:\\\\Apps\\\\freedom_system\\\\app_cabinet\\\\whisper_stt\\\\venv\\\\Scripts\\\\python.exe\":*)",
+      "Bash(ls:*)",
+      "Bash(git -C \"F:/Apps/freedom_system/REPO_claude_code_voice_mode\" mv claude_code_voice_mode_server.py claude_code_voice_mode_mcp_server.py)",
+      "Bash(git -C \"F:/Apps/freedom_system/REPO_claude_code_voice_mode\" status)",
+      "Bash(git -C \"F:/Apps/freedom_system/REPO_claude_code_voice_mode\" diff)",
+      "Bash(git -C \"F:/Apps/freedom_system/REPO_claude_code_voice_mode\" log --oneline -5)",
+      "Bash(git -C \"F:/Apps/freedom_system/REPO_claude_code_voice_mode\" add claude_code_voice_mode_mcp_server.py README.md start_claude_code_voice_mode.bat .claude/settings.local.json)"
     ]
   }
 }

@@ -73,8 +73,37 @@ echo Starting VS Code with Claude Code...
 goto running
 
 :launch_terminal
-echo Opening Terminal for Claude Code CLI...
-start "Claude Code Terminal" cmd /k "cd /d F:\Apps\freedom_system && echo. && echo  Claude Code Voice Mode is ready. && echo  AllTalk TTS: http://127.0.0.1:7851 && echo  Whisper STT: http://127.0.0.1:8787 && echo. && echo  Type your commands below. && echo."
+setlocal enabledelayedexpansion
+echo.
+echo ========================================
+echo  Select working directory:
+echo ========================================
+echo.
+echo   1. F:\Apps\freedom_system
+set "DIR_1=F:\Apps\freedom_system"
+set "DIR_COUNT=1"
+
+for /d %%D in ("F:\Apps\freedom_system\REPO_*") do (
+    set /a DIR_COUNT+=1
+    echo   !DIR_COUNT!. %%~nxD
+    set "DIR_!DIR_COUNT!=%%D"
+)
+
+echo.
+set "DIR_CHOICE="
+set /p "DIR_CHOICE=Enter choice (1-!DIR_COUNT!): "
+if not defined DIR_CHOICE set "DIR_CHOICE=1"
+call set "SELECTED_DIR=%%DIR_!DIR_CHOICE!%%"
+if not defined SELECTED_DIR (
+    echo Invalid choice. Defaulting to F:\Apps\freedom_system
+    set "SELECTED_DIR=F:\Apps\freedom_system"
+)
+
+echo.
+echo Opening Terminal in: !SELECTED_DIR!
+endlocal & set "SELECTED_DIR=%SELECTED_DIR%"
+
+start "Claude Code Terminal" cmd /k "cd /d %SELECTED_DIR% && echo. && echo  Claude Code Voice Mode is ready. && echo  AllTalk TTS: http://127.0.0.1:7851 && echo  Whisper STT: http://127.0.0.1:8787 && echo. && echo  Type your commands below. && echo."
 goto running
 
 :running
