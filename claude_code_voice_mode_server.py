@@ -1,6 +1,6 @@
 """
-VS Claude Code Voice Mode MCP Server
-Custom MCP server providing voice I/O for Claude Code in VS Code.
+Claude Code Voice Mode MCP Server
+Custom MCP server providing voice I/O for Claude Code.
 - speak(text): Sends text to AllTalk TTS, plays audio
 - listen(): Captures mic audio, sends to Whisper STT, returns text
 - converse(message): Full loop - speak message, listen for response
@@ -13,6 +13,7 @@ import logging
 import struct
 import tempfile
 import threading
+import time
 import wave
 from pathlib import Path
 from typing import Optional
@@ -33,12 +34,12 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 VAD_AGGRESSIVENESS = 2  # 0-3, higher = more aggressive filtering
 
-LOG_FILE = Path("F:/Apps/freedom_system/log/vs_claude_code_voice_mode.log")
+LOG_FILE = Path("F:/Apps/freedom_system/log/claude_code_voice_mode.log")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="[VS_CLAUDE_CODE_VOICE_MODE] [%(levelname)s] %(message)s",
+    format="[CLAUDE_CODE_VOICE_MODE] [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler(str(LOG_FILE), encoding="utf-8"),
@@ -52,6 +53,32 @@ logger = logging.getLogger(__name__)
 current_voice = DEFAULT_VOICE
 mic_muted = False
 mic_mode = "push_to_talk"  # push_to_talk, toggle, always_on
+STATE_FILE = Path("F:/Apps/freedom_system/REPO_claude_code_voice_mode/mic_state.json")
+
+
+def is_tts_paused() -> bool:
+    """Check if TTS is paused by reading the shared state file."""
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return state.get("tts_paused", False)
+    except Exception:
+        return False
+
+
+def _wait_for_playback_or_pause():
+    """Wait for audio playback to complete, or stop if TTS is paused."""
+    while True:
+        try:
+            stream = sd.get_stream()
+            if not stream.active:
+                break
+        except RuntimeError:
+            break
+        if is_tts_paused():
+            sd.stop()
+            logger.info("Playback stopped: TTS paused")
+            break
+        time.sleep(0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +184,7 @@ def play_audio_from_url(url: str):
         if frames:
             audio = np.concatenate(frames).astype(np.float32) / 32768.0
             sd.play(audio, samplerate=24000)
-            sd.wait()
+            _wait_for_playback_or_pause()
 
         Path(tmp_path).unlink(missing_ok=True)
     except Exception as e:
@@ -183,7 +210,7 @@ def play_audio_bytes(audio_bytes: bytes):
         if frames:
             audio = np.concatenate(frames).astype(np.float32) / 32768.0
             sd.play(audio, samplerate=target_rate)
-            sd.wait()
+            _wait_for_playback_or_pause()
     except Exception as e:
         logger.error(f"Audio playback failed: {e}")
 
@@ -193,6 +220,9 @@ def play_audio_bytes(audio_bytes: bytes):
 # ---------------------------------------------------------------------------
 def speak_text(text: str, voice: Optional[str] = None) -> dict:
     """Send text to AllTalk TTS and play the result."""
+    if is_tts_paused():
+        logger.info("TTS is paused, skipping speech")
+        return {"status": "paused", "message": "TTS is currently paused via mic panel"}
     voice = voice or current_voice
     logger.info(f"Speaking: '{text[:80]}...' with voice={voice}")
 
@@ -224,7 +254,7 @@ def speak_text(text: str, voice: Optional[str] = None) -> dict:
             "narrator_voice_gen": "",
             "text_not_inside": "character",
             "language": "en",
-            "output_file_name": "vs_claude_code_voice_mode",
+            "output_file_name": "claude_code_voice_mode",
             "output_file_timestamp": "true",
             "autoplay": "false",
             "autoplay_volume": "0.8",
@@ -283,7 +313,7 @@ def transcribe_audio(audio: np.ndarray) -> str:
 # ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
-server = Server("vs-claude-code-voice-mode")
+server = Server("claude-code-voice-mode")
 
 
 @server.list_tools()
@@ -408,7 +438,7 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Voice set to: {current_voice}")]
 
     elif name == "voice_status":
-        status = {"alltalk": "unknown", "whisper": "unknown", "voice": current_voice, "voices": []}
+        status = {"alltalk": "unknown", "whisper": "unknown", "voice": current_voice, "voices": [], "tts_paused": is_tts_paused()}
         try:
             r = requests.get(f"{ALLTALK_URL}/api/ready", timeout=3)
             status["alltalk"] = "ready" if r.status_code == 200 else f"error ({r.status_code})"
@@ -433,7 +463,7 @@ async def call_tool(name: str, arguments: dict):
 async def main():
     from mcp.server.stdio import stdio_server
 
-    logger.info("VS Claude Code Voice Mode MCP server starting...")
+    logger.info("Claude Code Voice Mode MCP server starting...")
     logger.info(f"AllTalk TTS: {ALLTALK_URL}")
     logger.info(f"Whisper STT: {WHISPER_URL}")
     logger.info(f"Default voice: {DEFAULT_VOICE}")
