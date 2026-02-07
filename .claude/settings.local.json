@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(curl:*)",
+      "Bash(python:*)",
+      "Bash(echo:*)",
+      "Bash(F:Appsfreedom_systemapp_cabinettalltalk_ttsstart_alltalk.bat)",
+      "Bash(cmd /c \"F:\\\\Apps\\\\freedom_system\\\\app_cabinet\\\\alltalk_tts\\\\start_alltalk.bat\")",
+      "Bash(cmd /c:*)",
+      "Bash(powershell:*)",
+      "WebFetch(domain:127.0.0.1)",
+      "Bash(node --version:*)",
+      "Bash(npm:*)",
+      "Bash(pip:*)",
+      "Bash(npx --version:*)",
+      "WebSearch",
+      "Bash(F:/Apps/freedom_system/REPO_claude_code_voice_mode/venv/Scripts/python.exe -m pip list:*)",
+      "Bash(uvx:*)",
+      "Bash(claude mcp add:*)",
+      "mcp__fetch__fetch",
+      "Bash(find:*)",
+      "Bash(test:*)",
+      "Bash(git checkout:*)",
+      "Bash(grep:*)",
+      "Bash(git push:*)",
+      "Bash(git mv:*)",
+      "Bash(git rm:*)",
+      "Bash(del nul)",
+      "Bash(git add:*)"
+    ]
+  }
+}

@@ -1,10 +1,10 @@
-# VS Claude Code Voice Mode
+# Claude Code Voice Mode
 
-MCP server providing voice I/O for Claude Code in VS Code.
+MCP server providing voice I/O for Claude Code.
 
 ## Components
 
-- **vs_claude_code_voice_mode_server.py** - MCP server with voice tools:
+- **claude_code_voice_mode_server.py** - MCP server with voice tools:
   - `speak(text)` - Send text to AllTalk TTS for audio playback
   - `listen()` - Capture mic audio via Whisper STT, return transcribed text
   - `converse(message)` - Speak a message then listen for a spoken response

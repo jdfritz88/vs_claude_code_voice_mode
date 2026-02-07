@@ -11,6 +11,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import time
+
 import numpy as np
 import requests
 import sounddevice as sd
@@ -18,6 +20,16 @@ import sounddevice as sd
 ALLTALK_URL = "http://127.0.0.1:7851"
 DEFAULT_VOICE = "Freya.wav"
 MAX_SPEAK_LENGTH = 2000  # Don't speak responses longer than this
+STATE_FILE = Path("F:/Apps/freedom_system/REPO_claude_code_voice_mode/mic_state.json")
+
+
+def is_tts_paused() -> bool:
+    """Check if TTS is paused by reading the shared state file."""
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return state.get("tts_paused", False)
+    except Exception:
+        return False
 
 
 def get_last_assistant_message(transcript_path: str) -> str:
@@ -48,6 +60,8 @@ def get_last_assistant_message(transcript_path: str) -> str:
 def speak(text: str):
     """Send text to AllTalk and play audio."""
     if not text or len(text) > MAX_SPEAK_LENGTH:
+        return
+    if is_tts_paused():
         return
 
     # Strip markdown formatting for cleaner speech
@@ -87,7 +101,17 @@ def speak(text: str):
             if frames:
                 audio = np.concatenate(frames).astype(np.float32) / 32768.0
                 sd.play(audio, samplerate=24000)
-                sd.wait()
+                while True:
+                    try:
+                        stream = sd.get_stream()
+                        if not stream.active:
+                            break
+                    except RuntimeError:
+                        break
+                    if is_tts_paused():
+                        sd.stop()
+                        break
+                    time.sleep(0.1)
     except Exception:
         pass  # Don't block Claude on TTS failure
 

@@ -1,5 +1,5 @@
 """
-VS Claude Code Voice Mode Microphone Control Panel
+Claude Code Voice Mode Microphone Control Panel
 Always-on-top floating window with:
 - Push to Talk (hold button)
 - Toggle to Talk (click to start/stop)
@@ -15,11 +15,13 @@ import socket
 import struct
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
 
 import numpy as np
+import requests
 import sounddevice as sd
 
 try:
@@ -35,19 +37,37 @@ except ImportError:
 WHISPER_URL = "http://127.0.0.1:8787"
 SAMPLE_RATE = 16000
 CHANNELS = 1
-STATE_FILE = Path("F:/Apps/freedom_system/freedom_system_2000/vs_claude_code_voice_mode/mic_state.json")
-LOG_FILE = Path("F:/Apps/freedom_system/log/vs_claude_code_voice_mode_mic_panel.log")
+STATE_FILE = Path("F:/Apps/freedom_system/REPO_claude_code_voice_mode/mic_state.json")
+LOG_FILE = Path("F:/Apps/freedom_system/log/claude_code_voice_mode_mic_panel.log")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+LOG_FORMAT = "[MIC_PANEL] [%(levelname)s] %(message)s"
 logging.basicConfig(
     level=logging.INFO,
-    format="[MIC_PANEL] [%(levelname)s] %(message)s",
+    format=LOG_FORMAT,
     handlers=[
-        logging.StreamHandler(),
         logging.FileHandler(str(LOG_FILE), encoding="utf-8"),
     ],
 )
 logger = logging.getLogger(__name__)
+
+
+class TextHandler(logging.Handler):
+    """Logging handler that writes to a tkinter Text widget (thread-safe)."""
+
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+
+    def emit(self, record):
+        msg = self.format(record) + "\n"
+        self.text_widget.after(0, self._append, msg)
+
+    def _append(self, msg):
+        self.text_widget.config(state=tk.NORMAL)
+        self.text_widget.insert(tk.END, msg)
+        self.text_widget.see(tk.END)
+        self.text_widget.config(state=tk.DISABLED)
 
 
 # ---------------------------------------------------------------------------
@@ -79,8 +99,8 @@ def create_tray_icon_image(color="green"):
 class MicControlPanel:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("VS Claude Code Voice Mode Mic")
-        self.root.geometry("280x420")
+        self.root.title("Claude Code Voice Mode Mic")
+        self.root.geometry("280x650")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -95,8 +115,10 @@ class MicControlPanel:
         self.level_value = 0.0
         self.tray_icon = None
         self.hidden = False
+        self.tts_paused = False
 
         self._build_ui()
+        self._setup_console_logging()
         self._update_state()
         self._start_level_monitor()
 
@@ -106,7 +128,7 @@ class MicControlPanel:
         title_frame = tk.Frame(self.root, bg="#2b2b2b")
         title_frame.pack(fill=tk.X, padx=0, pady=0)
         tk.Label(
-            title_frame, text="VS Claude Code Voice Mode", font=("Segoe UI", 12, "bold"),
+            title_frame, text="Claude Code Voice Mode", font=("Segoe UI", 12, "bold"),
             bg="#2b2b2b", fg="white", pady=8
         ).pack()
 
@@ -172,6 +194,33 @@ class MicControlPanel:
             font=("Segoe UI", 8), command=self._on_volume_change
         )
         self.vol_slider.pack(fill=tk.X)
+
+        # TTS Control
+        tts_frame = tk.LabelFrame(self.root, text="TTS Control", font=("Segoe UI", 9), padx=10, pady=5)
+        tts_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.tts_pause_btn = tk.Button(
+            tts_frame, text="Pause TTS", font=("Segoe UI", 10, "bold"),
+            bg="#FF9800", fg="white", activebackground="#F57C00",
+            command=self._toggle_tts_pause
+        )
+        self.tts_pause_btn.pack(fill=tk.X)
+
+        # Embedded console log
+        console_frame = tk.LabelFrame(self.root, text="Console", font=("Segoe UI", 9), padx=5, pady=5)
+        console_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        console_scroll = tk.Scrollbar(console_frame)
+        console_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.console_text = tk.Text(
+            console_frame, height=8, font=("Consolas", 8),
+            bg="#1e1e1e", fg="#cccccc", insertbackground="#cccccc",
+            state=tk.DISABLED, wrap=tk.WORD,
+            yscrollcommand=console_scroll.set
+        )
+        self.console_text.pack(fill=tk.BOTH, expand=True)
+        console_scroll.config(command=self.console_text.yview)
 
         # Bottom buttons
         bottom_frame = tk.Frame(self.root)
@@ -264,6 +313,27 @@ class MicControlPanel:
         """Handle volume slider change."""
         self._update_state()
 
+    def _toggle_tts_pause(self):
+        """Toggle TTS pause state."""
+        self.tts_paused = not self.tts_paused
+        if self.tts_paused:
+            self.tts_pause_btn.config(text="Continue TTS", bg="#4CAF50")
+            logger.info("TTS paused")
+            try:
+                requests.put("http://127.0.0.1:7851/api/stop-generation", timeout=2)
+            except Exception as e:
+                logger.warning(f"Failed to stop AllTalk generation: {e}")
+        else:
+            self.tts_pause_btn.config(text="Pause TTS", bg="#FF9800")
+            logger.info("TTS resumed")
+        self._update_state()
+
+    def _setup_console_logging(self):
+        """Attach a TextHandler to the logger so logs appear in the embedded console."""
+        handler = TextHandler(self.console_text)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        logger.addHandler(handler)
+
     def _update_state(self):
         """Save current state to file for MCP server."""
         state = {
@@ -271,6 +341,7 @@ class MicControlPanel:
             "recording": self.is_recording,
             "muted": self.is_muted,
             "volume": self.volume.get(),
+            "tts_paused": self.tts_paused,
         }
         save_mic_state(state)
 
@@ -316,7 +387,7 @@ class MicControlPanel:
             pystray.MenuItem("Show", self._restore_from_tray),
             pystray.MenuItem("Quit", self._quit_from_tray),
         )
-        self.tray_icon = pystray.Icon("vs_claude_code_voice_mode", icon_image, "VS Claude Code Voice Mode", menu)
+        self.tray_icon = pystray.Icon("claude_code_voice_mode", icon_image, "Claude Code Voice Mode", menu)
 
         tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
         tray_thread.start()
