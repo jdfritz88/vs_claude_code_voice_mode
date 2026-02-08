@@ -33,6 +33,8 @@ DEFAULT_VOICE = "Freya.wav"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 VAD_AGGRESSIVENESS = 2  # 0-3, higher = more aggressive filtering
+STREAMING_CHUNK_SIZE = 4096  # bytes per iter_content chunk
+WAV_HEADER_SIZE = 44  # standard WAV header
 
 LOG_FILE = Path("F:/Apps/freedom_system/log/claude_code_voice_mode.log")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +54,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 current_voice = DEFAULT_VOICE
 mic_muted = False
+_streaming_available: Optional[bool] = None  # None = not yet checked
 mic_mode = "push_to_talk"  # push_to_talk, toggle, always_on
 STATE_FILE = Path("F:/Apps/freedom_system/REPO_claude_code_voice_mode/mic_state.json")
 
@@ -218,15 +221,147 @@ def play_audio_bytes(audio_bytes: bytes):
 # ---------------------------------------------------------------------------
 # TTS: Send text to AllTalk
 # ---------------------------------------------------------------------------
+def _parse_wav_header(header: bytes) -> Optional[dict]:
+    """Parse a 44-byte WAV header and return audio format info."""
+    if len(header) < WAV_HEADER_SIZE:
+        return None
+    try:
+        riff, size, wave_id = struct.unpack_from("<4sI4s", header, 0)
+        if riff != b"RIFF" or wave_id != b"WAVE":
+            return None
+        # fmt chunk starts at offset 12
+        fmt_id, fmt_size, audio_fmt, channels, sample_rate = struct.unpack_from(
+            "<4sIHHI", header, 12
+        )
+        byte_rate, block_align, bits_per_sample = struct.unpack_from(
+            "<IHH", header, 28
+        )
+        return {
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "bits_per_sample": bits_per_sample,
+            "block_align": block_align,
+        }
+    except struct.error:
+        return None
+
+
+def speak_text_streaming(text: str, voice: str) -> dict:
+    """Stream audio from AllTalk's streaming endpoint for low-latency playback."""
+    global _streaming_available
+
+    params = {
+        "text": text,
+        "voice": voice,
+        "language": "en",
+        "output_file": "streaming_output.wav",
+    }
+    response = requests.get(
+        f"{ALLTALK_URL}/api/tts-generate-streaming",
+        params=params,
+        stream=True,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    # Read WAV header from first bytes of stream
+    header = b""
+    for chunk in response.iter_content(chunk_size=WAV_HEADER_SIZE):
+        header += chunk
+        if len(header) >= WAV_HEADER_SIZE:
+            break
+
+    fmt = _parse_wav_header(header[:WAV_HEADER_SIZE])
+    if fmt is None:
+        response.close()
+        raise ValueError("Invalid WAV header from streaming endpoint")
+
+    sr = fmt["sample_rate"]
+    ch = fmt["channels"]
+    dtype = "int16" if fmt["bits_per_sample"] == 16 else "int32"
+    frame_size = fmt["block_align"]  # bytes per frame (channels * bytes_per_sample)
+
+    logger.info(
+        f"Streaming TTS: {sr}Hz, {ch}ch, {fmt['bits_per_sample']}bit"
+    )
+
+    stream = sd.RawOutputStream(
+        samplerate=sr, channels=ch, dtype=dtype
+    )
+    stream.start()
+
+    # Any leftover bytes after the header
+    leftover = header[WAV_HEADER_SIZE:]
+    remainder = b""
+
+    try:
+        # Process leftover from header read
+        if leftover:
+            remainder = leftover
+
+        for chunk in response.iter_content(chunk_size=STREAMING_CHUNK_SIZE):
+            if is_tts_paused():
+                logger.info("Streaming playback stopped: TTS paused")
+                break
+
+            data = remainder + chunk
+            # Align to frame boundary
+            usable = len(data) - (len(data) % frame_size)
+            if usable > 0:
+                stream.write(data[:usable])
+            remainder = data[usable:]
+
+        # Write any final remainder (should be frame-aligned if stream is well-formed)
+        if remainder and not is_tts_paused():
+            # Pad to frame boundary if needed
+            pad = frame_size - (len(remainder) % frame_size)
+            if pad < frame_size:
+                remainder += b"\x00" * pad
+            stream.write(remainder)
+
+    finally:
+        # Wait for remaining audio to play out, checking for pause
+        while stream.active:
+            if is_tts_paused():
+                logger.info("Draining stopped: TTS paused")
+                break
+            time.sleep(0.05)
+        stream.stop()
+        stream.close()
+        response.close()
+
+    _streaming_available = True
+    return {"status": "spoken", "voice": voice, "length": len(text)}
+
+
 def speak_text(text: str, voice: Optional[str] = None) -> dict:
-    """Send text to AllTalk TTS and play the result."""
+    """Send text to AllTalk TTS and play the result.
+
+    Tries three methods in order:
+      1. Streaming (lowest latency — plays chunks as they arrive)
+      2. OpenAI-compatible endpoint (/v1/audio/speech)
+      3. AllTalk native endpoint (/api/tts-generate)
+    """
+    global _streaming_available
+
     if is_tts_paused():
         logger.info("TTS is paused, skipping speech")
         return {"status": "paused", "message": "TTS is currently paused via mic panel"}
     voice = voice or current_voice
     logger.info(f"Speaking: '{text[:80]}...' with voice={voice}")
 
-    # Try OpenAI-compatible endpoint first
+    # Method 1: Streaming (fastest — plays audio as it's generated)
+    if _streaming_available is not False:
+        try:
+            return speak_text_streaming(text, voice)
+        except Exception as e:
+            if _streaming_available is None:
+                logger.info(f"Streaming not available, disabling: {e}")
+                _streaming_available = False
+            else:
+                logger.warning(f"Streaming failed (transient), falling back: {e}")
+
+    # Method 2: OpenAI-compatible endpoint
     try:
         response = requests.post(
             f"{ALLTALK_URL}/v1/audio/speech",
@@ -438,7 +573,7 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Voice set to: {current_voice}")]
 
     elif name == "voice_status":
-        status = {"alltalk": "unknown", "whisper": "unknown", "voice": current_voice, "voices": [], "tts_paused": is_tts_paused()}
+        status = {"alltalk": "unknown", "whisper": "unknown", "voice": current_voice, "voices": [], "tts_paused": is_tts_paused(), "streaming_available": _streaming_available}
         try:
             r = requests.get(f"{ALLTALK_URL}/api/ready", timeout=3)
             status["alltalk"] = "ready" if r.status_code == 200 else f"error ({r.status_code})"
