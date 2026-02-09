@@ -41,7 +41,8 @@ LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
-    format="[CLAUDE_CODE_VOICE_MODE] [%(levelname)s] %(message)s",
+    format="[CLAUDE_CODE_VOICE_MODE] [%(asctime)s] [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler(str(LOG_FILE), encoding="utf-8"),
@@ -56,6 +57,8 @@ current_voice = DEFAULT_VOICE
 mic_muted = False
 _streaming_available: Optional[bool] = None  # None = not yet checked
 mic_mode = "push_to_talk"  # push_to_talk, toggle, always_on
+_services_available: bool = False
+_voice_mode_disabled: bool = False
 STATE_FILE = Path("F:/Apps/freedom_system/REPO_claude_code_voice_mode/mic_state.json")
 
 
@@ -246,6 +249,11 @@ def _parse_wav_header(header: bytes) -> Optional[dict]:
         return None
 
 
+class StreamingStallError(Exception):
+    """Raised when streaming TTS stalls beyond calculated limits."""
+    pass
+
+
 def speak_text_streaming(text: str, voice: str) -> dict:
     """Stream audio from AllTalk's streaming endpoint for low-latency playback."""
     global _streaming_available
@@ -289,26 +297,73 @@ def speak_text_streaming(text: str, voice: str) -> dict:
         samplerate=sr, channels=ch, dtype=dtype
     )
     stream.start()
+    logger.info(
+        f"[STREAM-A] RawOutputStream opened: device={sd.default.device[1]}, "
+        f"sr={sr}, ch={ch}, dtype={dtype}, latency={stream.latency}"
+    )
 
     # Any leftover bytes after the header
     leftover = header[WAV_HEADER_SIZE:]
     remainder = b""
+    total_bytes_written = 0
+    chunk_count = 0
+    first_chunk_logged = False
+    t_start = time.monotonic()
+    t_first_write = None
+    exit_reason = "exhausted"  # "exhausted", "paused", "write_error", "stall"
 
     try:
         # Process leftover from header read
         if leftover:
             remainder = leftover
 
+        last_chunk_time = time.monotonic()
+
         for chunk in response.iter_content(chunk_size=STREAMING_CHUNK_SIZE):
+            now = time.monotonic()
+            chunk_gap = now - last_chunk_time
+            last_chunk_time = now
+
+            # AllTalk delivers chunks continuously. A gap this long means
+            # the generation pipeline has stalled. This threshold is based on
+            # observed AllTalk behavior: 1-5s total generation, chunks every ~10ms.
+            # A 10s gap is far beyond normal and indicates a real problem.
+            if chunk_gap > 10.0 and chunk_count > 0:
+                logger.warning(
+                    f"[STREAM-STALL] No chunk for {chunk_gap:.1f}s "
+                    f"(after {chunk_count} chunks, {total_bytes_written} bytes). "
+                    f"Treating as stall."
+                )
+                exit_reason = "stall"
+                break
+
             if is_tts_paused():
                 logger.info("Streaming playback stopped: TTS paused")
+                exit_reason = "paused"
                 break
 
             data = remainder + chunk
             # Align to frame boundary
             usable = len(data) - (len(data) % frame_size)
             if usable > 0:
-                stream.write(data[:usable])
+                try:
+                    stream.write(data[:usable])
+                    total_bytes_written += usable
+                    chunk_count += 1
+                    if not first_chunk_logged:
+                        t_first_write = time.monotonic()
+                        first_chunk_logged = True
+                        logger.info(
+                            f"[STREAM-B] First chunk written: {usable} bytes "
+                            f"(time_to_first_audio={t_first_write - t_start:.3f}s)"
+                        )
+                except sd.PortAudioError as e:
+                    logger.error(
+                        f"[STREAM-E] stream.write() failed: {e} "
+                        f"(after {total_bytes_written} bytes, {chunk_count} chunks)"
+                    )
+                    exit_reason = "write_error"
+                    break
             remainder = data[usable:]
 
         # Write any final remainder (should be frame-aligned if stream is well-formed)
@@ -317,70 +372,91 @@ def speak_text_streaming(text: str, voice: str) -> dict:
             pad = frame_size - (len(remainder) % frame_size)
             if pad < frame_size:
                 remainder += b"\x00" * pad
-            stream.write(remainder)
+            try:
+                stream.write(remainder)
+                total_bytes_written += len(remainder)
+            except sd.PortAudioError as e:
+                logger.error(f"[STREAM-E] Final stream.write() failed: {e}")
+
+        t_loop_end = time.monotonic()
+        logger.info(
+            f"[STREAM-C] Iter loop done: {chunk_count} chunks, {total_bytes_written} bytes, "
+            f"reason={exit_reason}, loop_duration={t_loop_end - (t_first_write or t_start):.3f}s"
+        )
 
     finally:
-        # Wait for remaining audio to play out, checking for pause
-        while stream.active:
+        # Calculate remaining playback from device output latency.
+        # stream.write() blocks until consumed, so the output buffer
+        # holds at most stream.latency seconds of unplayed audio.
+        try:
+            output_latency = stream.latency
+            if isinstance(output_latency, tuple):
+                output_latency = output_latency[1]  # (input_latency, output_latency)
+        except Exception:
+            output_latency = 0.2  # safe fallback for Windows audio
+
+        remaining_playback = output_latency + 0.5
+
+        logger.info(
+            f"[STREAM-D] Drain: device_latency={output_latency:.3f}s, "
+            f"calculated_wait={remaining_playback:.3f}s"
+        )
+
+        # Wait the calculated time, checking for pause every 50ms
+        drain_end = time.monotonic() + remaining_playback
+        while time.monotonic() < drain_end:
             if is_tts_paused():
-                logger.info("Draining stopped: TTS paused")
+                logger.info("[STREAM-D] Drain interrupted: TTS paused")
                 break
             time.sleep(0.05)
+
+        stall_detected = exit_reason == "stall"
+        if stall_detected:
+            logger.warning("[STREAM-D] Stall confirmed: streaming will be disabled")
+
         stream.stop()
         stream.close()
         response.close()
+
+        t_end = time.monotonic()
+        logger.info(
+            f"[STREAM-D] Complete: {total_bytes_written} bytes, {chunk_count} chunks, "
+            f"wall={t_end - t_start:.3f}s, "
+            f"audio_dur={total_bytes_written / (sr * frame_size) if sr and frame_size else 0:.3f}s"
+        )
+
+        if stall_detected:
+            raise StreamingStallError(
+                f"Streaming stalled after {chunk_count} chunks, "
+                f"{total_bytes_written} bytes"
+            )
 
     _streaming_available = True
     return {"status": "spoken", "voice": voice, "length": len(text)}
 
 
-def speak_text(text: str, voice: Optional[str] = None) -> dict:
-    """Send text to AllTalk TTS and play the result.
-
-    Tries three methods in order:
-      1. Streaming (lowest latency — plays chunks as they arrive)
-      2. OpenAI-compatible endpoint (/v1/audio/speech)
-      3. AllTalk native endpoint (/api/tts-generate)
-    """
-    global _streaming_available
-
-    if is_tts_paused():
-        logger.info("TTS is paused, skipping speech")
-        return {"status": "paused", "message": "TTS is currently paused via mic panel"}
+def speak_text_nonstreaming(text: str, voice: Optional[str] = None) -> dict:
+    """Speak using non-streaming methods only (Methods 2/3). Used for recovery."""
     voice = voice or current_voice
-    logger.info(f"Speaking: '{text[:80]}...' with voice={voice}")
-
-    # Method 1: Streaming (fastest — plays audio as it's generated)
-    if _streaming_available is not False:
-        try:
-            return speak_text_streaming(text, voice)
-        except Exception as e:
-            if _streaming_available is None:
-                logger.info(f"Streaming not available, disabling: {e}")
-                _streaming_available = False
-            else:
-                logger.warning(f"Streaming failed (transient), falling back: {e}")
 
     # Method 2: OpenAI-compatible endpoint
     try:
+        logger.info("[NONSTREAM] Trying OpenAI endpoint (Method 2)")
         response = requests.post(
             f"{ALLTALK_URL}/v1/audio/speech",
-            json={
-                "input": text,
-                "voice": voice,
-                "model": "tts-1",
-                "response_format": "wav",
-            },
+            json={"input": text, "voice": voice, "model": "tts-1", "response_format": "wav"},
             timeout=30,
         )
         if response.status_code == 200:
             play_audio_bytes(response.content)
+            logger.info(f"[NONSTREAM] Method 2 success: {len(response.content)} bytes")
             return {"status": "spoken", "voice": voice, "length": len(text)}
     except Exception as e:
-        logger.warning(f"OpenAI endpoint failed, trying legacy: {e}")
+        logger.warning(f"[NONSTREAM] Method 2 failed: {e}")
 
-    # Fallback to AllTalk native endpoint
+    # Method 3: AllTalk native endpoint
     try:
+        logger.info("[NONSTREAM] Trying native endpoint (Method 3)")
         payload = {
             "text_input": text,
             "text_filtering": "standard",
@@ -398,11 +474,7 @@ def speak_text(text: str, voice: Optional[str] = None) -> dict:
             "temperature": "0.75",
             "repetition_penalty": "1.0",
         }
-        response = requests.post(
-            f"{ALLTALK_URL}/api/tts-generate",
-            data=payload,
-            timeout=30,
-        )
+        response = requests.post(f"{ALLTALK_URL}/api/tts-generate", data=payload, timeout=30)
         if response.status_code == 200:
             result = response.json()
             audio_url = result.get("output_file_url", "")
@@ -410,11 +482,168 @@ def speak_text(text: str, voice: Optional[str] = None) -> dict:
                 if not audio_url.startswith("http"):
                     audio_url = f"{ALLTALK_URL}{audio_url}"
                 play_audio_from_url(audio_url)
+                logger.info(f"[NONSTREAM] Method 3 success: url={audio_url}")
                 return {"status": "spoken", "voice": voice, "length": len(text)}
     except Exception as e:
-        logger.error(f"TTS generation failed: {e}")
+        logger.error(f"[NONSTREAM] Method 3 failed: {e}")
 
-    return {"status": "error", "message": "TTS generation failed"}
+    return {"status": "error", "message": "All non-streaming TTS methods failed"}
+
+
+def _handle_streaming_failure(original_text: str, voice: str) -> dict:
+    """Handle streaming failure: notify user via non-streaming, verify audio, offer fix."""
+    global _voice_mode_disabled
+
+    logger.info("[RECOVERY] Starting streaming failure recovery")
+
+    # Inform user via TTS using non-streaming mode
+    notify_result = speak_text_nonstreaming(
+        "Streaming audio had a problem. I've switched to regular mode. Can you hear me?",
+        voice,
+    )
+
+    if notify_result.get("status") != "spoken":
+        # Non-streaming also failed — total audio failure
+        logger.error("[RECOVERY] Non-streaming notification also failed")
+        _voice_mode_disabled = True
+        return {
+            "status": "error",
+            "voice_mode_disabled": True,
+            "message": "Audio playback completely failed (both streaming and non-streaming). Voice mode disabled.",
+            "action": "BEGIN_DMAIC_TROUBLESHOOTING",
+            "instruction": (
+                "TOTAL AUDIO FAILURE — both streaming and non-streaming playback failed. "
+                "Voice mode disabled. Communicate via text only. BEGIN DMAIC troubleshooting "
+                "NOW. Read the DMAIC process at "
+                "F:/Apps/freedom_system/standards/DMAIC_coding_process_tool.md "
+                "and follow it systematically. Check AllTalk TTS service, audio output "
+                "device, sounddevice configuration, and speaker connections."
+            ),
+        }
+
+    # Listen for user response
+    logger.info("[RECOVERY] Listening for user confirmation...")
+    try:
+        audio = record_audio(duration=8.0, silence_timeout=3.0)
+        if len(audio) > 0:
+            response_text = transcribe_audio(audio).strip().lower()
+            logger.info(f"[RECOVERY] User response: '{response_text}'")
+
+            # If user confirms hearing — offer to fix streaming
+            yes_words = ["yes", "yeah", "yep", "yup", "hear", "ok", "okay", "can", "working"]
+            if any(word in response_text for word in yes_words):
+                logger.info("[RECOVERY] User confirmed audio works. Speaking original text.")
+                speak_text_nonstreaming(original_text, voice)
+                speak_text_nonstreaming(
+                    "Good, you can hear me. I'm going to start troubleshooting the streaming issue now.",
+                    voice,
+                )
+                return {
+                    "status": "spoken_with_recovery",
+                    "streaming_disabled": True,
+                    "user_confirmed_audio": True,
+                    "length": len(original_text),
+                    "action": "BEGIN_DMAIC_TROUBLESHOOTING",
+                    "instruction": (
+                        "Streaming audio stalled but non-streaming audio works. "
+                        "The user confirmed they can hear. BEGIN DMAIC troubleshooting "
+                        "of the streaming TTS issue NOW. Read the DMAIC process at "
+                        "F:/Apps/freedom_system/standards/DMAIC_coding_process_tool.md "
+                        "and follow it systematically. The known root cause is the "
+                        "infinite drain loop in speak_text_streaming() — "
+                        "while stream.active never becomes False for sd.RawOutputStream "
+                        "without a callback. Notify the user via speak that you are "
+                        "beginning DMAIC troubleshooting."
+                    ),
+                }
+
+            # If user says no — disable voice mode
+            no_words = ["no", "nope", "can't", "cannot", "nothing", "don't"]
+            if any(word in response_text for word in no_words):
+                logger.warning("[RECOVERY] User cannot hear audio. Disabling voice mode.")
+                _voice_mode_disabled = True
+                return {
+                    "status": "error",
+                    "voice_mode_disabled": True,
+                    "message": "User confirmed they cannot hear audio. Voice mode disabled.",
+                    "action": "BEGIN_DMAIC_TROUBLESHOOTING",
+                    "instruction": (
+                        "The user CANNOT hear any audio (streaming or non-streaming). "
+                        "Voice mode is now disabled — communicate via text only. "
+                        "BEGIN DMAIC troubleshooting NOW. Read the DMAIC process at "
+                        "F:/Apps/freedom_system/standards/DMAIC_coding_process_tool.md "
+                        "and follow it systematically. The problem is broader than "
+                        "just the streaming drain loop — non-streaming audio also "
+                        "failed. Investigate audio output device, AllTalk TTS service, "
+                        "and sounddevice configuration."
+                    ),
+                }
+
+        # No response or unclear response
+        logger.info("[RECOVERY] No clear response from user")
+    except Exception as e:
+        logger.error(f"[RECOVERY] Listen/transcribe failed: {e}")
+
+    # Unclear response — speak original text anyway (in case they CAN hear)
+    # and return with unclear status. Still start DMAIC either way.
+    speak_text_nonstreaming(original_text, voice)
+    return {
+        "status": "spoken_with_recovery",
+        "streaming_disabled": True,
+        "user_response_unclear": True,
+        "length": len(original_text),
+        "action": "BEGIN_DMAIC_TROUBLESHOOTING",
+        "instruction": (
+            "Streaming failed. Switched to regular mode and spoke the message, "
+            "but could not confirm the user heard it. BEGIN DMAIC troubleshooting "
+            "NOW. Read the DMAIC process at "
+            "F:/Apps/freedom_system/standards/DMAIC_coding_process_tool.md "
+            "and follow it systematically. First ask the user (via text) if they "
+            "can hear, then proceed with troubleshooting."
+        ),
+    }
+
+
+def speak_text(text: str, voice: Optional[str] = None) -> dict:
+    """Send text to AllTalk TTS and play the result.
+
+    Tries streaming first, then falls back to non-streaming methods.
+    Catches StreamingStallError to trigger recovery flow.
+    """
+    global _streaming_available, _voice_mode_disabled
+
+    # If voice mode was disabled by recovery handler, return immediately
+    if _voice_mode_disabled:
+        return {
+            "status": "error",
+            "voice_mode_disabled": True,
+            "message": "Voice mode is disabled because audio was not working. Communicate via text.",
+        }
+
+    if is_tts_paused():
+        logger.info("TTS is paused, skipping speech")
+        return {"status": "paused", "message": "TTS is currently paused via mic panel"}
+
+    voice = voice or current_voice
+    logger.info(f"Speaking: '{text[:80]}...' with voice={voice}")
+
+    # Method 1: Streaming (fastest — plays audio as it's generated)
+    if _streaming_available is not False:
+        try:
+            return speak_text_streaming(text, voice)
+        except StreamingStallError as e:
+            logger.error(f"Streaming stalled: {e}")
+            _streaming_available = False
+            return _handle_streaming_failure(text, voice)
+        except Exception as e:
+            if _streaming_available is None:
+                logger.info(f"Streaming not available, disabling: {e}")
+                _streaming_available = False
+            else:
+                logger.warning(f"Streaming failed (transient), falling back: {e}")
+
+    # Methods 2/3 via non-streaming function
+    return speak_text_nonstreaming(text, voice)
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +763,41 @@ async def list_tools():
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
-    global current_voice
+    global current_voice, _services_available
+
+    # voice_status always allowed (reports service state for diagnostics)
+    if name != "voice_status" and not _services_available:
+        # Re-check (services may have started since server launch)
+        alltalk_ok = whisper_ok = False
+        try:
+            r = requests.get(f"{ALLTALK_URL}/api/ready", timeout=2)
+            alltalk_ok = r.status_code == 200
+        except Exception:
+            pass
+        try:
+            r = requests.get(f"{WHISPER_URL}/health", timeout=2)
+            whisper_ok = r.status_code == 200
+        except Exception:
+            pass
+
+        if alltalk_ok and whisper_ok:
+            _services_available = True
+            logger.info("Services now available. Voice mode activated.")
+        else:
+            return [TextContent(type="text", text=json.dumps({
+                "status": "unavailable",
+                "message": "Voice services not running. Start them with start_claude_code_voice_mode.bat",
+                "alltalk": "OK" if alltalk_ok else "offline",
+                "whisper": "OK" if whisper_ok else "offline",
+            }))]
+
+    # If voice mode was disabled by recovery, block speak/listen/converse
+    if name in ("speak", "listen", "converse") and _voice_mode_disabled:
+        return [TextContent(type="text", text=json.dumps({
+            "status": "error",
+            "voice_mode_disabled": True,
+            "message": "Voice mode is disabled because the user could not hear audio. Communicate via text only. Offer to investigate the audio problem.",
+        }))]
 
     if name == "speak":
         text = arguments.get("text", "")
@@ -573,7 +836,7 @@ async def call_tool(name: str, arguments: dict):
         return [TextContent(type="text", text=f"Voice set to: {current_voice}")]
 
     elif name == "voice_status":
-        status = {"alltalk": "unknown", "whisper": "unknown", "voice": current_voice, "voices": [], "tts_paused": is_tts_paused(), "streaming_available": _streaming_available}
+        status = {"alltalk": "unknown", "whisper": "unknown", "voice": current_voice, "voices": [], "tts_paused": is_tts_paused(), "streaming_available": _streaming_available, "voice_mode_disabled": _voice_mode_disabled}
         try:
             r = requests.get(f"{ALLTALK_URL}/api/ready", timeout=3)
             status["alltalk"] = "ready" if r.status_code == 200 else f"error ({r.status_code})"
@@ -598,10 +861,37 @@ async def call_tool(name: str, arguments: dict):
 async def main():
     from mcp.server.stdio import stdio_server
 
+    global _services_available
+
     logger.info("Claude Code Voice Mode MCP server starting...")
     logger.info(f"AllTalk TTS: {ALLTALK_URL}")
     logger.info(f"Whisper STT: {WHISPER_URL}")
     logger.info(f"Default voice: {DEFAULT_VOICE}")
+
+    # Health check — are voice services actually running?
+    alltalk_ok = False
+    whisper_ok = False
+    try:
+        r = requests.get(f"{ALLTALK_URL}/api/ready", timeout=2)
+        alltalk_ok = r.status_code == 200
+    except Exception:
+        pass
+    try:
+        r = requests.get(f"{WHISPER_URL}/health", timeout=2)
+        whisper_ok = r.status_code == 200
+    except Exception:
+        pass
+
+    _services_available = alltalk_ok and whisper_ok
+
+    if _services_available:
+        logger.info("Services detected: AllTalk OK, Whisper OK. Voice mode ACTIVE.")
+    else:
+        logger.warning(
+            f"Services not ready (AllTalk={'OK' if alltalk_ok else 'OFFLINE'}, "
+            f"Whisper={'OK' if whisper_ok else 'OFFLINE'}). "
+            f"Voice tools will return 'not available'. Start services with start_claude_code_voice_mode.bat"
+        )
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
