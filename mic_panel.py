@@ -105,7 +105,7 @@ class MicControlPanel:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Claude Code Voice Mode Mic")
-        self.root.geometry("280x820")
+        self.root.geometry("280x860")
         self.root.resizable(False, True)
         self.root.attributes("-topmost", True)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -190,13 +190,22 @@ class MicControlPanel:
         )
         device_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
 
+        device_inner = tk.Frame(device_frame)
+        device_inner.pack(fill=tk.X)
+
         device_names = ["Windows Default"] + [d["name"] for d in self._input_devices]
         self.device_combo = ttk.Combobox(
-            device_frame, textvariable=self.selected_device,
+            device_inner, textvariable=self.selected_device,
             values=device_names, state="readonly", font=("Segoe UI", 8)
         )
-        self.device_combo.pack(fill=tk.X)
+        self.device_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.device_combo.bind("<<ComboboxSelected>>", self._on_device_change)
+
+        self.device_refresh_btn = tk.Button(
+            device_inner, text="\u21bb", font=("Segoe UI", 10),
+            width=3, command=self._refresh_devices
+        )
+        self.device_refresh_btn.pack(side=tk.RIGHT, padx=(5, 0))
 
         # Title
         title_frame = tk.Frame(self.root, bg="#2b2b2b")
@@ -315,6 +324,16 @@ class MicControlPanel:
         shutdown_menu.add_command(label="Close Whisper Only", command=self._shutdown_whisper)
         self.shutdown_mb.config(menu=shutdown_menu)
 
+        # Restart button
+        restart_frame = tk.Frame(self.root)
+        restart_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
+
+        tk.Button(
+            restart_frame, text="Restart Mic Panel", font=("Segoe UI", 9, "bold"),
+            bg="#2196F3", fg="white", activebackground="#1976D2",
+            padx=8, pady=4, command=self._restart
+        ).pack(fill=tk.X)
+
         # Bottom buttons
         bottom_frame = tk.Frame(self.root)
         bottom_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
@@ -355,6 +374,20 @@ class MicControlPanel:
         self._level_monitor_stop = threading.Event()
         self._start_level_monitor()
 
+    def _refresh_devices(self):
+        """Re-query input devices and update the dropdown."""
+        self._input_devices = self._query_input_devices()
+        device_names = ["Windows Default"] + [d["name"] for d in self._input_devices]
+        self.device_combo['values'] = device_names
+
+        current = self.selected_device.get()
+        if current not in device_names:
+            self.selected_device.set("Windows Default")
+            logger.info("Previously selected device no longer available, reset to Windows Default")
+            self._on_device_change()
+
+        logger.info(f"Refreshed input devices: {len(self._input_devices)} found")
+
     def _on_button_press(self, event=None):
         mode = self.mode.get()
         if mode == "push_to_talk":
@@ -382,6 +415,11 @@ class MicControlPanel:
             self._recording_frames.clear()
         self._rms_log_counter = 0
 
+        # In push-to-talk mode, holding the button unmutes the mic
+        if self.mode.get() == "push_to_talk":
+            self.is_muted = False
+            self.mute_btn.config(text="Mute", bg="#666")
+
         self.is_recording = True
         self.action_btn.config(bg="#f44336")
         self.status_label.config(text="Recording...", fg="#ff4444")
@@ -399,6 +437,11 @@ class MicControlPanel:
             self.action_btn.config(bg="#4CAF50", text="Click to Talk")
         else:
             self.action_btn.config(bg="#4CAF50", text="Hold to Talk")
+
+        # In push-to-talk mode, releasing the button mutes the mic
+        if mode == "push_to_talk":
+            self.is_muted = True
+            self.mute_btn.config(text="Unmute", bg="#f44336")
 
         self._update_state()
 
@@ -704,9 +747,7 @@ class MicControlPanel:
 
             # When recording: accumulate frames
             if self.is_recording:
-                current_mode = self.mode.get()
-                # In push_to_talk mode, pressing the button IS the unmute action
-                if current_mode != "push_to_talk" and self.is_muted:
+                if self.is_muted:
                     return
                 scaled = (indata.copy().astype(np.float32) * multiplier).astype(np.int16)
                 with self._recording_lock:
@@ -1032,6 +1073,19 @@ class MicControlPanel:
             self.root.after(0, self._quit)
 
         threading.Thread(target=shutdown_all, daemon=True).start()
+
+    def _restart(self):
+        """Restart the mic panel with updated code."""
+        logger.info("Restarting mic panel...")
+        self._level_monitor_stop.set()
+        if self.tray_icon:
+            self.tray_icon.stop()
+        # Launch a new instance of this script, then exit
+        subprocess.Popen(
+            [sys.executable, __file__],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        self.root.destroy()
 
     def _quit(self):
         """Clean shutdown."""
