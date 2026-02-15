@@ -1,0 +1,552 @@
+# Multi-Instance Terminal Support + Terminal PID Fix
+# COMPLETE IMPLEMENTATION PLAN
+# Date: 2026-02-12
+# Branch: Branch05_claude_code_voice_mode-basic_mic_connected
+
+===============================================
+BACKGROUND: WHAT WORKS AND WHAT DOESN'T
+===============================================
+
+The Hold-to-Talk pipeline (record -> transcribe -> inject) is IMPLEMENTED in mic_panel.py.
+Recording works, Whisper transcription works, WAV processing works.
+
+Terminal injection FAILS because:
+1. User runs Windows Terminal (not standalone cmd.exe)
+2. All tabs share one WindowsTerminal.exe PID (40112)
+3. AttachConsole to WindowsTerminal.exe fails (error 6 -- no console)
+4. EnumWindows matched the mic panel's own window ("Claude Code Voice Mode Mic" contains "claude")
+5. The actual cmd.exe CHILD processes inside Windows Terminal DO have real consoles (via conhost.exe)
+6. AttachConsole to the child cmd.exe PID WORKS -- confirmed live on this system
+
+CRITICAL TECHNICAL FINDING:
+- Windows Terminal uses ConPTY, but each tab's cmd.exe still gets its own real conhost.exe
+- conhost.exe handles all Console API servicing (input/output buffers)
+- WriteConsoleInputW through AttachConsole to child cmd.exe works through ConPTY
+- Tested live: AttachConsole(66532) to cmd.exe child -> WriteConsoleInputW -> SUCCESS
+
+PROCESS TREE (confirmed via wmic):
+  WindowsTerminal.exe (PID 40112) -- GUI frontend, NO console
+    +-- cmd.exe (PID 66532) -- "Claude Code Terminal" tab
+    |     +-- conhost.exe (PID 61692) -- real console host for this tab
+    |     +-- claude.exe (PID 56792) -- Claude CLI
+    |           +-- python.exe (PID 62348) -- our MCP server
+    +-- cmd.exe (PID 57596) -- "Whisper STT" tab
+    |     +-- conhost.exe (PID 55080)
+    +-- cmd.exe (PID 54968) -- "AllTalk TTS" tab
+          +-- conhost.exe (PID 60344)
+
+WINDOW ENUMERATION (all 13 visible windows on system):
+  PID=66212  exe=pythonw3.10.exe       title=Claude Code Voice Mode Mic
+  PID=40112  exe=WindowsTerminal.exe   title=braille_dot Claude Code Terminal
+  PID=40112  exe=WindowsTerminal.exe   title=C:\WINDOWS\system32\cmd.exe
+  PID=40112  exe=WindowsTerminal.exe   title=AllTalk TTS - call start_alltalk.bat
+  PID=40112  exe=WindowsTerminal.exe   title=Whisper STT - python server.py
+  PID=12172  exe=explorer.exe          title=REPO_claude_code_voice_mode - File Explorer
+  PID=18884  exe=chrome.exe            title=127.0.0.1:8787 - Google Chrome
+  PID=16896  exe=claude.exe            title=Claude
+
+KEY: Window titles are USELESS for finding the right process because:
+- All Windows Terminal tabs share PID 40112
+- Claude Code changes the terminal title via SetConsoleTitle/process.title
+- The mic panel's own window contains "claude" in its title
+- SOLUTION: Use wmic process command line matching instead
+
+===============================================
+USER REQUIREMENTS: MULTI-INSTANCE TERMINAL SYSTEM
+===============================================
+
+1. The bat file already lets user pick a repo folder (REPO_* directories)
+2. Every terminal gets named after the repo folder WITH a number suffix, ALWAYS starting at _01
+   - First terminal: REPO_claude_code_voice_mode_01
+   - Second instance of same repo: REPO_claude_code_voice_mode_02
+   - First terminal of different repo: REPO_other_project_01
+3. The bat file must detect existing terminals with matching repo names to determine the next number
+4. The mic panel gets a NEW selector at the VERY TOP showing all detected Claude Code terminals
+5. User picks which terminal receives transcribed speech
+6. Multiple Claude Code instances all connect to the same mic panel
+
+===============================================
+FILES TO MODIFY
+===============================================
+
+1. F:\Apps\freedom_system\REPO_claude_code_voice_mode\start_claude_code_voice_mode.bat
+2. F:\Apps\freedom_system\REPO_claude_code_voice_mode\mic_panel.py
+
+NO changes to:
+- claude_code_voice_mode_mcp_server.py (MCP server is independent, reads mic_state.json)
+- mic_state.json (existing format sufficient)
+
+===============================================
+PART 1: BAT FILE -- DYNAMIC TERMINAL NAMING
+===============================================
+
+File: F:\Apps\freedom_system\REPO_claude_code_voice_mode\start_claude_code_voice_mode.bat
+
+--- 1A. Replace lines 129-134 (terminal launch section) ---
+
+CURRENT CODE (lines 129-134):
+```
+echo.
+echo Opening Terminal in: !SELECTED_DIR!
+endlocal & set "SELECTED_DIR=%SELECTED_DIR%"
+
+start "Claude Code Terminal" cmd /k "cd /d %SELECTED_DIR% && echo. && echo  Claude Code Voice Mode is ready. && echo  AllTalk TTS: http://127.0.0.1:7851 && echo  Whisper STT: http://127.0.0.1:8787 && echo. && echo  Type your commands below. && echo."
+goto running
+```
+
+NEW CODE:
+```batch
+echo.
+echo Opening Terminal in: !SELECTED_DIR!
+
+REM --- Extract folder name from selected directory ---
+for %%F in ("!SELECTED_DIR!") do set "FOLDER_NAME=%%~nxF"
+
+REM --- Capture all cmd.exe command lines for searching ---
+set "WMIC_DUMP="
+for /f "usebackq skip=1 tokens=*" %%L in (`wmic process where "name='cmd.exe'" get commandline 2^>nul`) do (
+    set "WMIC_DUMP=!WMIC_DUMP! %%L"
+)
+
+REM --- Find first available instance number (01-99) ---
+set "NEXT_NUM="
+for /l %%I in (1,1,99) do (
+    if not defined NEXT_NUM (
+        if %%I lss 10 (set "TEST_NUM=0%%I") else (set "TEST_NUM=%%I")
+        echo !WMIC_DUMP! | findstr /i /c:"title !FOLDER_NAME!_!TEST_NUM!" >nul 2>&1
+        if errorlevel 1 set "NEXT_NUM=!TEST_NUM!"
+    )
+)
+if not defined NEXT_NUM set "NEXT_NUM=01"
+
+set "TERMINAL_NAME=!FOLDER_NAME!_!NEXT_NUM!"
+echo  Terminal name: !TERMINAL_NAME!
+
+endlocal & set "SELECTED_DIR=%SELECTED_DIR%" & set "TERMINAL_NAME=%TERMINAL_NAME%"
+
+start "%TERMINAL_NAME%" cmd /k "title %TERMINAL_NAME% && cd /d %SELECTED_DIR% && echo. && echo  Claude Code Voice Mode is ready. && echo  Terminal: %TERMINAL_NAME% && echo  AllTalk TTS: http://127.0.0.1:7851 && echo  Whisper STT: http://127.0.0.1:8787 && echo. && echo  Type your commands below. && echo."
+goto running
+```
+
+HOW IT WORKS:
+- "for %%F" extracts the last path component (e.g., "REPO_claude_code_voice_mode")
+- wmic dumps all cmd.exe command lines into WMIC_DUMP
+- Iterates 01-99, uses findstr to check if "title FOLDER_NAME_NN" exists in any command line
+- "if not defined NEXT_NUM" guard stops at the first available number
+- The "title %TERMINAL_NAME%" command INSIDE cmd /k is critical:
+  - It embeds the terminal name in the cmd.exe command line
+  - This is how the mic panel discovers terminals via wmic
+  - Even if Claude Code later changes the window title, the command line never changes
+- The "start" command's first argument also sets the initial window title (visible in Windows Terminal tab)
+
+WHY "title" INSIDE cmd /k:
+- "start "Title" cmd /k" sets the initial window title
+- But Claude Code (Node.js) overwrites it via process.title / SetConsoleTitle
+- The "title" command inside the command line is preserved in the process command line forever
+- wmic shows commandline, so we can always find it by searching for "title REPO_name_NN"
+
+--- 1B. Update shutdown (line 163) ---
+
+CURRENT:
+```batch
+taskkill /fi "WINDOWTITLE eq Claude Code Terminal" /t /f >nul 2>&1
+```
+
+NEW:
+```batch
+REM --- Kill all Claude Code terminals (by command line pattern) ---
+for /f "usebackq tokens=2 delims=," %%P in (`wmic process where "name='cmd.exe' and commandline like '%%title REPO_%%'" get processid /format:csv 2^>nul ^| findstr /r "[0-9]"`) do (
+    echo   Stopping Claude Code terminal (PID %%P)...
+    taskkill /pid %%P /t /f >nul 2>&1
+)
+```
+
+NOTE: Also handle non-REPO folders (freedom_system_01 etc.) if needed. The pattern "title REPO_" covers REPO_* folders. For the root freedom_system folder, adjust the LIKE pattern or use a broader match.
+
+--- 1C. Special case: F:\Apps\freedom_system (no REPO_ prefix) ---
+
+Option 1 in the directory picker is F:\Apps\freedom_system itself.
+Its folder name is "freedom_system", not a REPO_* name.
+The code handles this correctly because the folder name extraction works on any path:
+  for %%F in ("F:\Apps\freedom_system") do set "FOLDER_NAME=%%~nxF"
+  -> FOLDER_NAME = freedom_system
+  -> TERMINAL_NAME = freedom_system_01
+
+The shutdown pattern "title REPO_" would NOT match "title freedom_system_01".
+Fix: Use "title " (without REPO_) in the LIKE pattern, or specifically kill known patterns.
+Better: Use a more distinctive prefix like all terminals get a common prefix.
+Simplest: Just match any cmd.exe with "title " followed by digits pattern.
+
+RECOMMENDATION: Keep shutdown simple -- kill by the TERMINAL_NAME variable stored during launch,
+or use a broader wmic pattern. This is a minor detail to refine during implementation.
+
+===============================================
+PART 2: MIC PANEL -- TERMINAL DISCOVERY
+===============================================
+
+File: F:\Apps\freedom_system\REPO_claude_code_voice_mode\mic_panel.py
+
+--- 2A. New import ---
+
+Add at top of file (around line 18, with other stdlib imports):
+```python
+import re
+```
+
+--- 2B. Replace state variables (in __init__, line 131) ---
+
+REMOVE:
+```python
+self._claude_terminal_pid = None
+```
+
+ADD:
+```python
+self._discovered_terminals = []       # list of (name, pid) tuples
+self._selected_terminal = tk.StringVar(value="")
+```
+
+--- 2C. New method: _discover_claude_terminals() ---
+
+PURPOSE: Find ALL Claude Code terminals by searching cmd.exe command lines via wmic.
+Returns list of (terminal_name, pid) tuples.
+
+```python
+def _discover_claude_terminals(self):
+    """Discover all Claude Code terminals by searching cmd.exe command lines.
+    Returns list of (terminal_name, pid) tuples."""
+    terminals = []
+    try:
+        result = subprocess.run(
+            ['wmic', 'process', 'where', "name='cmd.exe'", 'get', 'processid,commandline'],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Match "title FOLDER_NN" pattern in command line
+            match = re.search(r'title\s+(\w+_\d{2})\b', line, re.IGNORECASE)
+            if match:
+                terminal_name = match.group(1)
+                # PID is the last number sequence on the line (wmic default format)
+                pid_match = re.search(r'(\d+)\s*$', line)
+                if pid_match:
+                    pid = int(pid_match.group(1))
+                    terminals.append((terminal_name, pid))
+                    logger.info(f"Discovered terminal: {terminal_name} (PID {pid})")
+    except Exception as e:
+        logger.error(f"Terminal discovery failed: {e}")
+    return terminals
+```
+
+HOW IT WORKS:
+- wmic outputs lines like: cmd /k "title REPO_claude_code_voice_mode_01 && cd /d ..."   66532
+- Regex r'title\s+(\w+_\d{2})\b' matches "title REPO_claude_code_voice_mode_01"
+- PID is extracted from the end of the line
+- Returns ALL matching terminals, not just one
+
+WHY wmic AND NOT window titles:
+- Window titles are unreliable (Claude Code changes them, Windows Terminal multiplexes them)
+- Command lines are immutable once the process starts
+- The "title FOLDER_NN" command is embedded in the command line by the bat file
+- This works regardless of terminal emulator (cmd.exe, Windows Terminal, etc.)
+
+--- 2D. New method: _get_selected_terminal_pid() ---
+
+```python
+def _get_selected_terminal_pid(self):
+    """Get the PID of the currently selected terminal.
+    Returns int PID or None."""
+    name = self._selected_terminal.get()
+    if not name:
+        return None
+    for term_name, pid in self._discovered_terminals:
+        if term_name == name:
+            return pid
+    return None
+```
+
+--- 2E. New method: _refresh_terminals() ---
+
+```python
+def _refresh_terminals(self):
+    """Re-scan for Claude Code terminals and update the dropdown."""
+    self._discovered_terminals = self._discover_claude_terminals()
+    names = [name for name, pid in self._discovered_terminals]
+    self.terminal_combo['values'] = names
+
+    current = self._selected_terminal.get()
+    if names:
+        if current not in names:
+            self._selected_terminal.set(names[0])
+            logger.info(f"Auto-selected terminal: {names[0]}")
+    else:
+        self._selected_terminal.set("")
+        logger.info("No Claude Code terminals found")
+```
+
+--- 2F. REMOVE old methods (replaced by wmic discovery) ---
+
+DELETE ENTIRELY:
+- _find_claude_terminal_pid()        (lines 535-545)
+- _find_claude_terminal_pid_tasklist() (lines 547-563)
+- _find_claude_terminal_pid_enum()    (lines 565-643)
+
+These used window titles and EnumWindows which don't work with Windows Terminal.
+
+===============================================
+PART 3: MIC PANEL -- UI CHANGES
+===============================================
+
+--- 3A. New terminal selector at VERY TOP of _build_ui() ---
+
+Insert BEFORE the Input Device selector (before current line 165).
+Pattern matches existing device selector (LabelFrame + Combobox):
+
+```python
+# Target Terminal selector (very top)
+terminal_frame = tk.LabelFrame(
+    self.root, text="Target Terminal", font=("Segoe UI", 9), padx=10, pady=5
+)
+terminal_frame.pack(fill=tk.X, padx=10, pady=(5, 0))
+
+terminal_inner = tk.Frame(terminal_frame)
+terminal_inner.pack(fill=tk.X)
+
+self.terminal_combo = ttk.Combobox(
+    terminal_inner, textvariable=self._selected_terminal,
+    values=[], state="readonly", font=("Segoe UI", 8)
+)
+self.terminal_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+self.terminal_refresh_btn = tk.Button(
+    terminal_inner, text="\u21bb", font=("Segoe UI", 10),
+    width=3, command=self._refresh_terminals
+)
+self.terminal_refresh_btn.pack(side=tk.RIGHT, padx=(5, 0))
+```
+
+LAYOUT: Combobox on left (expandable), refresh button on right.
+The "\u21bb" is a Unicode reload/refresh symbol.
+
+--- 3B. Initial terminal discovery ---
+
+At end of __init__, after self._start_level_monitor(), add:
+```python
+self._refresh_terminals()
+```
+
+--- 3C. Adjust window geometry ---
+
+Change line 108:
+  FROM: self.root.geometry("280x760")
+  TO:   self.root.geometry("280x820")
+
+Adds ~60px for the new terminal selector.
+
+===============================================
+PART 4: MIC PANEL -- MODIFIED INJECTION
+===============================================
+
+--- 4A. Rewrite _inject_text_into_terminal() ---
+
+Replace the old PID lookup (which used self._claude_terminal_pid and the deleted
+_find_claude_terminal_pid methods) with _get_selected_terminal_pid().
+
+```python
+def _inject_text_into_terminal(self, text):
+    """Inject transcribed text into the selected Claude Code Terminal and press Enter.
+    Returns True on success, False on failure."""
+    if not text.strip():
+        logger.warning("No text to inject")
+        return False
+
+    pid = self._get_selected_terminal_pid()
+    if pid is None:
+        # Try refreshing terminals first
+        self._refresh_terminals()
+        pid = self._get_selected_terminal_pid()
+        if pid is None:
+            logger.error("No Claude Code Terminal selected or found")
+            return False
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.FreeConsole()
+
+    if not kernel32.AttachConsole(pid):
+        error_code = ctypes.GetLastError()
+        logger.warning(f"AttachConsole({pid}) failed (error {error_code})")
+        # Terminal might have closed -- refresh and retry
+        self._refresh_terminals()
+        pid = self._get_selected_terminal_pid()
+        if pid is None or not kernel32.AttachConsole(pid):
+            logger.error("Cannot attach to Claude Code Terminal after retry")
+            return False
+
+    try:
+        ok = self._write_console_keys(text)
+        if not ok:
+            logger.error("Failed to write text characters to console")
+            return False
+
+        time.sleep(0.05)
+
+        ok = self._write_console_keys("\r")
+        if not ok:
+            logger.error("Failed to write Enter key to console")
+            return False
+
+        terminal_name = self._selected_terminal.get()
+        logger.info(f"Injected {len(text)} chars + Enter into {terminal_name} (PID {pid})")
+        return True
+    finally:
+        self._detach_console()
+```
+
+KEY CHANGES FROM ORIGINAL:
+- Uses _get_selected_terminal_pid() instead of self._claude_terminal_pid
+- On failure, calls _refresh_terminals() instead of _find_claude_terminal_pid()
+- Logs the terminal name from the dropdown
+- _write_console_keys() and _detach_console() are UNCHANGED -- they already work correctly
+
+--- 4B. Update _process_recording() status message ---
+
+In _process_recording(), the failure status "Terminal not found" should be more descriptive:
+  FROM: self.root.after(0, self._set_status, "Terminal not found", "#ff4444")
+  TO:   self.root.after(0, self._set_status, "No terminal selected", "#ff4444")
+
+===============================================
+EXISTING CODE THAT STAYS UNCHANGED
+===============================================
+
+These methods are correct and need NO modification:
+- _write_console_keys() (lines 906-972) -- WriteConsoleInputW via CONIN$
+- _detach_console() (lines 900-904) -- FreeConsole + reset Ctrl handler
+- _start_recording() -- opens InputStream, accumulates frames, mode-aware mute (already fixed)
+- _stop_recording() -- closes stream, launches processing thread
+- _process_recording() -- background thread: frames -> WAV -> Whisper -> inject (minor status text change)
+- _numpy_to_wav_bytes() -- numpy int16 to WAV
+- _transcribe_audio_direct() -- POST to Whisper
+- _set_status() / _reset_status_if_idle() -- UI helpers
+- All shutdown methods (_graceful_shutdown_service, _shutdown_alltalk, etc.)
+- All tray methods
+- Level monitor
+
+===============================================
+IMPLEMENTATION SEQUENCE
+===============================================
+
+1. Bat file: Add folder name extraction after directory selection
+2. Bat file: Add wmic-based number detection loop
+3. Bat file: Change start command to use dynamic TERMINAL_NAME with "title" inside cmd /k
+4. Bat file: Update shutdown to kill by command line pattern
+5. Mic panel: Add "import re"
+6. Mic panel: Replace _claude_terminal_pid with _discovered_terminals and _selected_terminal
+7. Mic panel: Add _discover_claude_terminals(), _get_selected_terminal_pid(), _refresh_terminals()
+8. Mic panel: Add terminal selector UI in _build_ui() (BEFORE device selector)
+9. Mic panel: Add _refresh_terminals() call at end of __init__
+10. Mic panel: Adjust window geometry to 280x820
+11. Mic panel: Rewrite _inject_text_into_terminal() to use selected terminal
+12. Mic panel: Delete _find_claude_terminal_pid(), _find_claude_terminal_pid_tasklist(), _find_claude_terminal_pid_enum()
+13. Test end-to-end
+
+===============================================
+ERROR HANDLING
+===============================================
+
+| Scenario                        | Behavior                                                    |
+|---------------------------------|-------------------------------------------------------------|
+| No terminals found              | Dropdown empty, "No terminal selected" on inject attempt    |
+| Selected terminal closed        | AttachConsole fails, refresh + retry, auto-select next      |
+| wmic command fails              | _discover_claude_terminals() catches exception, returns []  |
+| Bat file wmic fails             | NEXT_NUM defaults to 01, terminal still launches            |
+| Multiple same-repo instances    | Bat iterates 01-99, finds first unused number               |
+| Rapid clicks while processing   | _start_recording() returns early (_processing guard)        |
+| Whisper offline                 | "Transcription failed" in status                            |
+| Silence only                    | RMS < 50, "No speech detected"                              |
+
+===============================================
+THREAD SAFETY (UNCHANGED FROM PREVIOUS)
+===============================================
+
+- _recording_frames: protected by _recording_lock
+- tkinter widgets: all background updates via root.after(0, ...)
+- _processing flag: prevents concurrent processing threads
+- _recording_stream: only accessed from main thread
+- _discovered_terminals: only written by _refresh_terminals (main thread or processing thread via root.after)
+
+===============================================
+VERIFICATION CHECKLIST
+===============================================
+
+1. Launch bat file -> verify terminal gets named REPO_claude_code_voice_mode_01
+2. Launch bat file again (same repo) -> verify second terminal gets _02
+3. Launch for different repo -> verify it gets REPO_other_01
+4. Open mic panel -> verify dropdown at top shows all terminals
+5. Click refresh button -> verify list updates
+6. Hold to Talk -> verify transcribed text lands in the selected terminal
+7. Switch terminal in dropdown -> Hold to Talk -> verify text goes to newly selected terminal
+8. Close a terminal -> refresh -> verify it disappears from dropdown
+9. No terminals running -> Hold to Talk -> verify "No terminal selected" status
+10. Level meter still works during and after recording
+
+===============================================
+KEY TECHNICAL DETAILS (REFERENCE)
+===============================================
+
+WriteConsoleInputW injection pipeline (confirmed working):
+  WriteConsoleInputW (mic_panel.py _write_console_keys)
+      |
+  Windows Console Input Buffer (inside conhost.exe for the tab)
+      |
+  libuv uv_tty_t raw mode -> ReadConsoleInputW()
+      |
+  libuv converts KEY_EVENT_RECORD -> UTF-8 bytes
+      |
+  Node.js process.stdin (tty.ReadStream, raw mode)
+      |
+  Ink useInput hook -> parseKeypress(data)
+      |
+  parseKeypress: '\r' -> { name: 'return' }   <-- TRIGGERS SUBMIT
+  parseKeypress: '\n' -> { name: 'enter' }    <-- DOES NOT TRIGGER SUBMIT
+      |
+  ink-text-input: key.return -> onSubmit()
+
+CRITICAL: Must send \r (0x0D) not \n (0x0A) for submission.
+The _write_console_keys() method handles this: vk = 0x0D if ch == '\r' else 0
+
+Console mode on the Claude Code terminal: 0x208 = ENABLE_ECHO_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT
+This is the expected mode for Node.js CLI in ConPTY.
+
+===============================================
+APPROACHES EVALUATED AND REJECTED
+===============================================
+
+1. Window title matching (tasklist WINDOWTITLE) -- REJECTED
+   - Windows Terminal multiplexes all tabs under one PID
+   - Claude Code changes title via SetConsoleTitle
+   - Mic panel's own window matches "claude" pattern
+
+2. EnumWindows partial title match -- REJECTED
+   - Same problems as above, plus matched mic panel itself
+
+3. Clipboard + SendInput -- REJECTED
+   - Pasting text+\r as one op doesn't trigger submit (Ink sees full string)
+   - Clobbers clipboard, requires window focus
+
+4. Named Pipe / Socket -- REJECTED
+   - No listener on Claude Code side, MCP is pull-based
+
+5. stdin Pipe -- REJECTED
+   - Claude Code stdin is TTY, redirecting crashes Ink
+
+6. AttachConsole to WindowsTerminal.exe -- REJECTED
+   - Error 6 (ERROR_INVALID_HANDLE), no console attached to GUI app
+
+CHOSEN: AttachConsole to child cmd.exe PID found via wmic command line matching.
+
+===============================================
+END OF PLAN
+===============================================
