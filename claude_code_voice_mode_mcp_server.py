@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 current_voice = DEFAULT_VOICE
 mic_muted = False
 _streaming_available: Optional[bool] = None  # None = not yet checked
-mic_mode = "push_to_talk"  # push_to_talk, toggle, always_on
+mic_mode = "push_to_talk"  # push_to_talk, toggle
 _services_available: bool = False
 _voice_mode_disabled: bool = False
 STATE_FILE = Path("F:/Apps/freedom_system/REPO_claude_code_voice_mode/mic_state.json")
@@ -69,6 +69,29 @@ def is_tts_paused() -> bool:
         return state.get("tts_paused", False)
     except Exception:
         return False
+
+
+def _get_input_device_index() -> Optional[int]:
+    """Read input_device from mic_state.json and resolve to a sounddevice index.
+
+    Returns the device index if a specific device is selected, or None to use
+    the system default.
+    """
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        device_name = state.get("input_device")
+        if not device_name:
+            return None
+        devices = sd.query_devices()
+        for i, d in enumerate(devices):
+            if d["max_input_channels"] > 0 and d["name"] == device_name:
+                logger.info(f"Using input device #{i}: {device_name}")
+                return i
+        logger.warning(f"Input device '{device_name}' not found, using default")
+        return None
+    except Exception as e:
+        logger.warning(f"Could not read input device from state: {e}")
+        return None
 
 
 def _wait_for_playback_or_pause():
@@ -116,7 +139,11 @@ def record_audio(duration: float = 5.0, silence_timeout: float = 2.0) -> np.ndar
     max_frames = int(duration * SAMPLE_RATE / frame_size)
     silence_frames_threshold = int(silence_timeout * 1000 / frame_duration_ms)
 
-    logger.info(f"Recording... (max {duration}s, silence timeout {silence_timeout}s)")
+    device_index = _get_input_device_index()
+    logger.info(
+        f"Recording... (max {duration}s, silence timeout {silence_timeout}s, "
+        f"device={'default' if device_index is None else device_index})"
+    )
 
     all_frames = []
     silence_count = 0
@@ -130,13 +157,17 @@ def record_audio(duration: float = 5.0, silence_timeout: float = 2.0) -> np.ndar
             return
         all_frames.append(indata.copy())
 
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        dtype="int16",
-        blocksize=frame_size,
-        callback=audio_callback,
-    ):
+    stream_kwargs = {
+        "samplerate": SAMPLE_RATE,
+        "channels": CHANNELS,
+        "dtype": "int16",
+        "blocksize": frame_size,
+        "callback": audio_callback,
+    }
+    if device_index is not None:
+        stream_kwargs["device"] = device_index
+
+    with sd.InputStream(**stream_kwargs):
         for _ in range(max_frames):
             sd.sleep(frame_duration_ms)
             if not all_frames:
@@ -272,14 +303,22 @@ def speak_text_streaming(text: str, voice: str) -> dict:
     )
     response.raise_for_status()
 
-    # Read WAV header from first bytes of stream
+    # Use a SINGLE iter_content() call for both header and audio data.
+    # Calling iter_content() twice on the same Response yields nothing
+    # on the second call (requests library behavior).
+    raw_iter = response.iter_content(chunk_size=STREAMING_CHUNK_SIZE)
+
+    # Accumulate WAV header from the first bytes of the stream
     header = b""
-    for chunk in response.iter_content(chunk_size=WAV_HEADER_SIZE):
+    for chunk in raw_iter:
         header += chunk
         if len(header) >= WAV_HEADER_SIZE:
             break
 
-    fmt = _parse_wav_header(header[:WAV_HEADER_SIZE])
+    leftover = header[WAV_HEADER_SIZE:]
+    header = header[:WAV_HEADER_SIZE]
+
+    fmt = _parse_wav_header(header)
     if fmt is None:
         response.close()
         raise ValueError("Invalid WAV header from streaming endpoint")
@@ -302,9 +341,7 @@ def speak_text_streaming(text: str, voice: str) -> dict:
         f"sr={sr}, ch={ch}, dtype={dtype}, latency={stream.latency}"
     )
 
-    # Any leftover bytes after the header
-    leftover = header[WAV_HEADER_SIZE:]
-    remainder = b""
+    remainder = leftover
     total_bytes_written = 0
     chunk_count = 0
     first_chunk_logged = False
@@ -313,13 +350,9 @@ def speak_text_streaming(text: str, voice: str) -> dict:
     exit_reason = "exhausted"  # "exhausted", "paused", "write_error", "stall"
 
     try:
-        # Process leftover from header read
-        if leftover:
-            remainder = leftover
-
         last_chunk_time = time.monotonic()
 
-        for chunk in response.iter_content(chunk_size=STREAMING_CHUNK_SIZE):
+        for chunk in raw_iter:  # Same iterator — continues after header
             now = time.monotonic()
             chunk_gap = now - last_chunk_time
             last_chunk_time = now
@@ -384,6 +417,11 @@ def speak_text_streaming(text: str, voice: str) -> dict:
             f"reason={exit_reason}, loop_duration={t_loop_end - (t_first_write or t_start):.3f}s"
         )
 
+        # If no audio data came through, raise so fallback can handle it
+        if total_bytes_written == 0:
+            exit_reason = "no_audio"
+            raise ValueError("Streaming returned WAV header but 0 bytes of audio data")
+
     finally:
         # Calculate remaining playback from device output latency.
         # stream.write() blocks until consumed, so the output buffer
@@ -432,7 +470,7 @@ def speak_text_streaming(text: str, voice: str) -> dict:
             )
 
     _streaming_available = True
-    return {"status": "spoken", "voice": voice, "length": len(text)}
+    return {"status": "spoken", "method": "streaming", "voice": voice, "length": len(text)}
 
 
 def speak_text_nonstreaming(text: str, voice: Optional[str] = None) -> dict:
@@ -450,7 +488,7 @@ def speak_text_nonstreaming(text: str, voice: Optional[str] = None) -> dict:
         if response.status_code == 200:
             play_audio_bytes(response.content)
             logger.info(f"[NONSTREAM] Method 2 success: {len(response.content)} bytes")
-            return {"status": "spoken", "voice": voice, "length": len(text)}
+            return {"status": "spoken", "method": "nonstreaming_openai", "voice": voice, "length": len(text)}
     except Exception as e:
         logger.warning(f"[NONSTREAM] Method 2 failed: {e}")
 
@@ -483,7 +521,7 @@ def speak_text_nonstreaming(text: str, voice: Optional[str] = None) -> dict:
                     audio_url = f"{ALLTALK_URL}{audio_url}"
                 play_audio_from_url(audio_url)
                 logger.info(f"[NONSTREAM] Method 3 success: url={audio_url}")
-                return {"status": "spoken", "voice": voice, "length": len(text)}
+                return {"status": "spoken", "method": "nonstreaming_native", "voice": voice, "length": len(text)}
     except Exception as e:
         logger.error(f"[NONSTREAM] Method 3 failed: {e}")
 
