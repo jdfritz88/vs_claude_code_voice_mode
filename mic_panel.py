@@ -43,6 +43,16 @@ WHISPER_URL = "http://127.0.0.1:8787"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 STATE_FILE = Path("F:/Apps/freedom_system/REPO_claude_code_voice_mode/mic_state.json")
+PREFS_FILE = Path("F:/Apps/freedom_system/REPO_claude_code_voice_mode/mic_prefs.json")
+
+# VAD Configuration
+VAD_AGGRESSIVENESS = 2         # 0 (least aggressive) to 3 (most aggressive)
+VAD_SILENCE_TIMEOUT = 5.0      # seconds of silence after speech to trigger send
+VAD_SPEECH_ONSET_FRAMES = 3    # consecutive 30ms speech frames to confirm speech start
+VAD_PRE_BUFFER_MS = 300        # milliseconds of pre-roll audio to keep
+VAD_MIN_RECORDING_S = 0.5      # minimum recording length to process
+VAD_FRAME_SAMPLES = 480        # 30ms at 16kHz — required by webrtcvad
+VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * 2  # 960 bytes (int16)
 LOG_FILE = Path("F:/Apps/freedom_system/log/claude_code_voice_mode_mic_panel.log")
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -86,6 +96,24 @@ def save_mic_state(state: dict):
         logger.error(f"Failed to save mic state: {e}")
 
 
+def load_prefs() -> dict:
+    """Load persistent preferences from file."""
+    try:
+        if PREFS_FILE.exists():
+            return json.loads(PREFS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.error(f"Failed to load prefs: {e}")
+    return {}
+
+
+def save_prefs(prefs: dict):
+    """Save persistent preferences to file."""
+    try:
+        PREFS_FILE.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.error(f"Failed to save prefs: {e}")
+
+
 def create_tray_icon_image(color="green"):
     """Create a small colored circle icon for system tray."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -121,20 +149,42 @@ class MicControlPanel:
         self.tray_icon = None
         self.hidden = False
         self.tts_paused = False
-        self.selected_device = tk.StringVar(value="Windows Default")
         self._level_monitor_stop = threading.Event()
         self._input_devices = self._query_input_devices()
+        # Restore last input device from prefs, fall back to Windows Default
+        prefs = load_prefs()
+        saved_device = prefs.get("input_device", "Windows Default")
+        available_names = ["Windows Default"] + [d["name"] for d in self._input_devices]
+        if saved_device in available_names:
+            self.selected_device = tk.StringVar(value=saved_device)
+            logger.info(f"Restored input device from prefs: {saved_device}")
+        else:
+            self.selected_device = tk.StringVar(value="Windows Default")
+            logger.info(f"Saved device '{saved_device}' not available, using Windows Default")
         self._recording_frames = []
         self._recording_lock = threading.Lock()
         self._processing = False
         self._discovered_terminals = []       # list of (name, pid) tuples
         self._selected_terminal = tk.StringVar(value="")
 
+        # VAD state (for toggle-to-talk with voice activity detection)
+        self._vad = None              # webrtcvad.Vad instance, created lazily
+        self._vad_state = "IDLE"      # IDLE, LISTENING, RECORDING, TRAILING, PROCESSING
+        self._vad_buffer = bytearray()  # sub-frame alignment buffer for 30ms chunks
+        self._vad_silence_count = 0   # consecutive non-speech 30ms frames
+        self._vad_speech_count = 0    # consecutive speech frames (for onset detection)
+        self._vad_pre_buffer = []     # rolling buffer of last ~10 frames (300ms)
+        self._vad_recording_frames = []  # accumulated 30ms byte chunks during speech
+
         self._build_ui()
         self._setup_console_logging()
         self._update_state()
         self._start_level_monitor()
         self._refresh_terminals()
+        # Retry terminal discovery after a delay in case Claude Code isn't ready yet
+        if not self._selected_terminal.get():
+            self.root.after(3000, self._refresh_terminals)
+            self.root.after(8000, self._refresh_terminals)
 
     def _query_input_devices(self):
         """Query available input devices, filtered to the default host API (MME on Windows)."""
@@ -163,7 +213,15 @@ class MicControlPanel:
 
     def _build_ui(self):
         """Build the tkinter UI."""
-        # Target Terminal selector (very top)
+        # Title ribbon (very top)
+        title_frame = tk.Frame(self.root, bg="#2b2b2b")
+        title_frame.pack(fill=tk.X, padx=0, pady=0)
+        tk.Label(
+            title_frame, text="Claude Code Voice Mode", font=("Segoe UI", 12, "bold"),
+            bg="#2b2b2b", fg="white", pady=8
+        ).pack()
+
+        # Target Terminal selector
         terminal_frame = tk.LabelFrame(
             self.root, text="Target Terminal", font=("Segoe UI", 9), padx=10, pady=5
         )
@@ -206,14 +264,6 @@ class MicControlPanel:
             width=3, command=self._refresh_devices
         )
         self.device_refresh_btn.pack(side=tk.RIGHT, padx=(5, 0))
-
-        # Title
-        title_frame = tk.Frame(self.root, bg="#2b2b2b")
-        title_frame.pack(fill=tk.X, padx=0, pady=0)
-        tk.Label(
-            title_frame, text="Claude Code Voice Mode", font=("Segoe UI", 12, "bold"),
-            bg="#2b2b2b", fg="white", pady=8
-        ).pack()
 
         # Status indicator
         self.status_frame = tk.Frame(self.root, bg="#1e1e1e")
@@ -356,18 +406,27 @@ class MicControlPanel:
         logger.info(f"Mode changed to: {mode}")
 
         if mode == "push_to_talk":
+            self._stop_vad_listening()
             self.action_btn.config(text="Hold to Talk")
             self._stop_recording()
         elif mode == "toggle":
-            self.action_btn.config(text="Click to Talk")
-            self._stop_recording()
+            self._stop_recording()  # stop any manual recording
+            if not self.is_muted:
+                self._start_vad_listening()
+            else:
+                self.action_btn.config(text="Click to Talk")
 
         self._update_state()
+        self._update_mode_labels()
 
     def _on_device_change(self, event=None):
         """Handle input device dropdown change."""
         device_name = self.selected_device.get()
         logger.info(f"Input device changed to: {device_name}")
+        # Persist the choice for next session
+        prefs = load_prefs()
+        prefs["input_device"] = device_name
+        save_prefs(prefs)
         self._update_state()
         # Restart level monitor with the new device
         self._level_monitor_stop.set()
@@ -393,10 +452,18 @@ class MicControlPanel:
         if mode == "push_to_talk":
             self._start_recording()
         elif mode == "toggle":
-            if self.is_recording:
-                self._stop_recording()
-            else:
-                self._start_recording()
+            # In VAD toggle mode, button press = "force send now"
+            if self._vad_state in ("RECORDING", "TRAILING"):
+                frames_copy = self._vad_recording_frames
+                self._vad_recording_frames = []
+                self._vad_state = "PROCESSING"
+                self._on_vad_silence_timeout(frames_copy)
+            elif self._vad_state == "IDLE":
+                # Fallback: old click-to-toggle behavior if VAD not active
+                if self.is_recording:
+                    self._stop_recording()
+                else:
+                    self._start_recording()
 
     def _on_button_release(self, event=None):
         mode = self.mode.get()
@@ -459,22 +526,221 @@ class MicControlPanel:
             self.status_label.config(text="Ready", fg="#00cc00")
             logger.info("Recording stopped (no frames captured)")
 
+    # -------------------------------------------------------------------
+    # VAD Toggle-to-Talk: voice activity detection methods
+    # -------------------------------------------------------------------
+    def _init_vad(self):
+        """Lazy initialization of webrtcvad."""
+        if self._vad is None:
+            try:
+                import webrtcvad
+                self._vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+                logger.info(f"VAD initialized (aggressiveness={VAD_AGGRESSIVENESS})")
+            except ImportError:
+                logger.error("webrtcvad not installed — VAD unavailable, falling back to manual toggle")
+                self._vad = False  # sentinel: tried and failed
+
+    def _start_vad_listening(self):
+        """Enter VAD LISTENING state — mic stays live, watching for speech."""
+        self._init_vad()
+        if self._vad is False:
+            return  # webrtcvad not available
+        self._vad_buffer = bytearray()
+        self._vad_pre_buffer = []
+        self._vad_recording_frames = []
+        self._vad_silence_count = 0
+        self._vad_speech_count = 0
+        self._vad_state = "LISTENING"
+        self.status_label.config(text="Listening...", fg="#00cc00")
+        self.action_btn.config(text="Listening...", bg="#4CAF50")
+        logger.info("VAD listening started")
+
+    def _stop_vad_listening(self):
+        """Return to IDLE — stop all VAD processing."""
+        self._vad_state = "IDLE"
+        self._vad_buffer = bytearray()
+        self._vad_pre_buffer = []
+        self._vad_recording_frames = []
+        self._vad_silence_count = 0
+        self._vad_speech_count = 0
+        logger.info("VAD listening stopped")
+
+    def _process_vad_frame(self, indata):
+        """Process audio through VAD. Called from audio callback — must be lightweight."""
+        multiplier = self.volume.get() / 50.0
+        scaled = (indata.copy().astype(np.float32) * multiplier).astype(np.int16)
+        raw_bytes = scaled.tobytes()
+
+        # Add to alignment buffer
+        self._vad_buffer.extend(raw_bytes)
+
+        pre_buffer_max = int(VAD_PRE_BUFFER_MS / 30)  # ~10 frames
+
+        # Process all complete 30ms sub-frames
+        while len(self._vad_buffer) >= VAD_FRAME_BYTES:
+            frame_bytes = bytes(self._vad_buffer[:VAD_FRAME_BYTES])
+            del self._vad_buffer[:VAD_FRAME_BYTES]
+
+            try:
+                is_speech = self._vad.is_speech(frame_bytes, SAMPLE_RATE)
+            except Exception:
+                continue
+
+            if self._vad_state == "LISTENING":
+                # Maintain pre-buffer (rolling window of recent audio)
+                self._vad_pre_buffer.append(frame_bytes)
+                if len(self._vad_pre_buffer) > pre_buffer_max:
+                    self._vad_pre_buffer.pop(0)
+
+                if is_speech:
+                    self._vad_speech_count += 1
+                    if self._vad_speech_count >= VAD_SPEECH_ONSET_FRAMES:
+                        # Speech confirmed — start recording
+                        self._vad_state = "RECORDING"
+                        self._vad_recording_frames = list(self._vad_pre_buffer)
+                        self._vad_recording_frames.append(frame_bytes)
+                        self._vad_silence_count = 0
+                        self.root.after(0, self._on_vad_recording_start)
+                else:
+                    self._vad_speech_count = 0
+
+            elif self._vad_state == "RECORDING":
+                self._vad_recording_frames.append(frame_bytes)
+                if not is_speech:
+                    self._vad_state = "TRAILING"
+                    self._vad_silence_count = 1
+                self._vad_speech_count = 0
+
+            elif self._vad_state == "TRAILING":
+                self._vad_recording_frames.append(frame_bytes)
+                if is_speech:
+                    self._vad_state = "RECORDING"
+                    self._vad_silence_count = 0
+                else:
+                    self._vad_silence_count += 1
+                    threshold = int(VAD_SILENCE_TIMEOUT * 1000 / 30)
+                    if self._vad_silence_count >= threshold:
+                        self._vad_state = "PROCESSING"
+                        frames_copy = self._vad_recording_frames
+                        self._vad_recording_frames = []
+                        self.root.after(0, self._on_vad_silence_timeout, frames_copy)
+
+    def _on_vad_recording_start(self):
+        """UI update when VAD detects speech onset. Called on main thread."""
+        self.status_label.config(text="Speech detected...", fg="#ff4444")
+        self.action_btn.config(text="Speaking...", bg="#f44336")
+        logger.info("VAD: speech onset detected")
+
+    def _on_vad_silence_timeout(self, vad_frames):
+        """Process captured audio after VAD silence timeout. Called on main thread."""
+        if self._processing:
+            logger.warning("Still processing previous VAD recording, dropping this one")
+            if self.mode.get() == "toggle" and not self.is_muted:
+                self._vad_state = "LISTENING"
+                self.status_label.config(text="Listening...", fg="#00cc00")
+                self.action_btn.config(text="Listening...", bg="#4CAF50")
+            else:
+                self._vad_state = "IDLE"
+            return
+
+        # Concatenate 30ms frame byte chunks into a single int16 array
+        raw_bytes = b"".join(vad_frames)
+        audio = np.frombuffer(raw_bytes, dtype=np.int16)
+        duration = len(audio) / SAMPLE_RATE
+
+        if duration < VAD_MIN_RECORDING_S:
+            logger.info(f"VAD recording too short ({duration:.2f}s), skipping")
+            if self.mode.get() == "toggle" and not self.is_muted:
+                self._vad_state = "LISTENING"
+                self.status_label.config(text="Listening...", fg="#00cc00")
+                self.action_btn.config(text="Listening...", bg="#4CAF50")
+            else:
+                self._vad_state = "IDLE"
+            return
+
+        self._processing = True
+        self.status_label.config(text="Processing...", fg="#ffcc00")
+        self.action_btn.config(text="Processing...", bg="#FF9800")
+
+        thread = threading.Thread(
+            target=self._process_vad_recording, args=(audio,), daemon=True
+        )
+        thread.start()
+
+    def _process_vad_recording(self, audio):
+        """Transcribe VAD-captured audio and inject into terminal. Runs in background thread."""
+        try:
+            duration = len(audio) / SAMPLE_RATE
+            rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
+            peak = np.max(np.abs(audio.astype(np.float32)))
+            logger.info(
+                f"VAD processing {duration:.1f}s of audio "
+                f"(RMS={rms:.1f}, peak={peak:.0f})"
+            )
+
+            if rms < 50:
+                logger.info(f"VAD recording was silence (RMS {rms:.1f} < 50), skipping")
+                self.root.after(0, self._set_status, "No speech detected", "#ff8800")
+                return
+
+            self.root.after(0, self._set_status, "Transcribing...", "#ffcc00")
+            wav_bytes = self._numpy_to_wav_bytes(audio)
+            logger.info(f"VAD WAV size: {len(wav_bytes)} bytes")
+            text = self._transcribe_audio_direct(wav_bytes)
+
+            if not text:
+                logger.warning("VAD transcription returned empty")
+                self.root.after(0, self._set_status, "No speech recognized", "#ff8800")
+                return
+
+            self.root.after(0, self._set_status, f"Sending: {text[:40]}...", "#00ccff")
+            success = self._inject_text_into_terminal(text)
+
+            if success:
+                self.root.after(0, self._set_status, "Sent!", "#00cc00")
+                logger.info(f"VAD: sent to terminal: '{text}'")
+            else:
+                self.root.after(0, self._set_status, "No terminal selected", "#ff4444")
+                logger.error("VAD: failed to inject text into terminal")
+        except Exception as e:
+            logger.error(f"VAD processing failed: {e}")
+            self.root.after(0, self._set_status, f"Error: {e}", "#ff4444")
+        finally:
+            self._processing = False
+            if self.mode.get() == "toggle" and not self.is_muted:
+                self._vad_state = "LISTENING"
+                self.root.after(0, self._set_status, "Listening...", "#00cc00")
+                self.root.after(0, lambda: self.action_btn.config(text="Listening...", bg="#4CAF50"))
+            else:
+                self._vad_state = "IDLE"
+                self.root.after(3000, self._reset_status_if_idle)
+
     def _toggle_mute(self):
         """Toggle microphone mute."""
         self.is_muted = not self.is_muted
         if self.is_muted:
             self.mute_btn.config(text="Unmute", bg="#f44336")
             self.status_label.config(text="Muted", fg="#ff8800")
+            if self.mode.get() == "toggle":
+                self._stop_vad_listening()
         else:
             self.mute_btn.config(text="Mute", bg="#666")
-            self.status_label.config(text="Ready", fg="#00cc00")
+            if self.mode.get() == "toggle":
+                self._start_vad_listening()
+            else:
+                self.status_label.config(text="Ready", fg="#00cc00")
         self._update_state()
         self._update_mode_labels()
         logger.info(f"Mute: {self.is_muted}")
 
     def _update_mode_labels(self):
-        """Update Toggle to Talk radio button label to show mute state."""
-        state = "(Muted)" if self.is_muted else "(Unmuted)"
+        """Update Toggle to Talk radio button label to show mute/VAD state."""
+        if self.is_muted:
+            state = "(Muted)"
+        elif self.mode.get() == "toggle":
+            state = "(VAD Active)"
+        else:
+            state = "(Unmuted)"
         self._rb_toggle.config(text=f"Toggle to Talk {state}")
 
     def _on_volume_change(self, value):
@@ -512,6 +778,7 @@ class MicControlPanel:
             "volume": self.volume.get(),
             "tts_paused": self.tts_paused,
             "input_device": None if device_name == "Windows Default" else device_name,
+            "vad_state": self._vad_state,
         }
         save_mic_state(state)
 
@@ -745,7 +1012,7 @@ class MicControlPanel:
             level = np.sqrt(np.mean(indata.astype(np.float32) ** 2)) * multiplier
             self.level_value = min(100, level * 500)
 
-            # When recording: accumulate frames
+            # When manually recording (push_to_talk or legacy toggle): accumulate frames
             if self.is_recording:
                 if self.is_muted:
                     return
@@ -758,6 +1025,12 @@ class MicControlPanel:
                 if self._rms_log_counter % 16 == 0:
                     rms = np.sqrt(np.mean(scaled.astype(np.float32) ** 2))
                     logger.debug(f"Recording RMS: {rms:.1f}")
+                return  # Don't also run VAD when manually recording
+
+            # VAD processing for toggle-to-talk mode
+            if (self._vad_state in ("LISTENING", "RECORDING", "TRAILING")
+                    and not self.is_muted):
+                self._process_vad_frame(indata)
 
         def monitor():
             try:
